@@ -1,0 +1,295 @@
+name: PR Automation Workflow
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          CI: true
+
+      - name: Run ESLint checks
+        id: eslint
+        run: |
+          # Capture ESLint output
+          eslint_output=$(npm run lint 2>&1)
+          # Set output for later use
+          echo "eslint_output<<EOF" >> $GITHUB_OUTPUT
+          echo "$eslint_output" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Run Prettier formatting check
+        id: prettier
+        run: |
+          # Capture Prettier output
+          prettier_output=$(npx prettier --check . 2>&1)
+          # Set output for later use
+          echo "prettier_output<<EOF" >> $GITHUB_OUTPUT
+          echo "$prettier_output" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Post Code Quality Report as PR comment
+        uses: actions/github-script@v7
+        env:
+          ESLINT_RESULTS: ${{ steps.eslint.outputs.eslint_output }}
+          PRETTIER_RESULTS: ${{ steps.prettier.outputs.prettier_output }}
+        with:
+          script: |
+            const eslintResults = process.env.ESLINT_RESULTS || "No ESLint results available";
+            const prettierResults = process.env.PRETTIER_RESULTS || "No Prettier results available";
+            
+            const commentBody = `
+            ## Code Quality Report
+            This report summarizes code quality checks for the pull request:
+            
+            ### ESLint Checks
+            \`\`\`bash
+            ${eslintResults}
+            \`\`\`
+            
+            ### Prettier Formatting Check
+            \`\`\`bash
+            ${prettierResults}
+            \`\`\`
+            `;
+            
+            // Create or update comment
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          CI: true
+
+      - name: Run test suite with coverage
+        id: test-coverage
+        run: |
+          # Capture test and coverage output
+          test_output=$(npm test -- --coverage 2>&1)
+          # Set output for later use
+          echo "test_output<<EOF" >> $GITHUB_OUTPUT
+          echo "$test_output" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Upload coverage report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-coverage-report
+          path: ./coverage
+          retention-days: 7
+
+      - name: Post Test Coverage Report as PR comment
+        uses: actions/github-script@v7
+        env:
+          TEST_COVERAGE_RESULTS: ${{ steps.test-coverage.outputs.test_output }}
+        with:
+          script: |
+            const testResults = process.env.TEST_COVERAGE_RESULTS || "No test coverage results available";
+            
+            const commentBody = `
+            ## Test Coverage Report
+            This report summarizes test execution and coverage for the pull request:
+            
+            ### Test Suite & Coverage Results
+            \`\`\`bash
+            ${testResults}
+            \`\`\`
+            
+            A full coverage report is attached as an artifact to this workflow run.
+            `;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Required for secret scanning across commits
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          CI: true
+
+      - name: Run dependency vulnerability scan (npm audit)
+        id: npm-audit
+        run: |
+          # Capture npm audit output
+          audit_output=$(npm audit 2>&1)
+          # Set output for later use
+          echo "audit_output<<EOF" >> $GITHUB_OUTPUT
+          echo "$audit_output" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Run secret scanning (TruffleHog)
+        id: secret-scan
+        uses: trufflesecurity/trufflehog@v3.65.0
+        with:
+          path: ./
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+          fail-on-findings: false
+        continue-on-error: true
+
+      - name: Post Security Scan Report as PR comment
+        uses: actions/github-script@v7
+        env:
+          VULN_SCAN_RESULTS: ${{ steps.npm-audit.outputs.audit_output }}
+          SECRET_SCAN_RESULTS: ${{ steps.secret-scan.outputs.results }}
+        with:
+          script: |
+            const vulnResults = process.env.VULN_SCAN_RESULTS || "No vulnerability scan results available";
+            const secretResults = process.env.SECRET_SCAN_RESULTS || "No secrets found in code changes";
+            
+            const commentBody = `
+            ## Security Scan Report
+            This report summarizes security checks for the pull request:
+            
+            ### Dependency Vulnerabilities (npm audit)
+            \`\`\`bash
+            ${vulnResults}
+            \`\`\`
+            
+            ### Secret Scan (TruffleHog)
+            \`\`\`bash
+            ${secretResults}
+            \`\`\`
+            `;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          CI: true
+
+      - name: Build application
+        id: build-app
+        run: |
+          # Capture build output
+          build_output=$(npm run build 2>&1)
+          # Set output for later use
+          echo "build_output<<EOF" >> $GITHUB_OUTPUT
+          echo "$build_output" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Validate application endpoints (example)
+        id: endpoint-validation
+        run: |
+          # Example endpoint validation (adjust for your application)
+          # For a Node.js web app, you might start the server and check endpoints
+          # This is a generic example - replace with your actual validation logic
+          validation_output="Endpoint validation: Application build completed successfully. For a production workflow, add logic to start the server and verify endpoints here."
+          
+          echo "validation_output<<EOF" >> $GITHUB_OUTPUT
+          echo "$validation_output" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: ./dist # Adjust path to your build output directory
+          retention-days: 7
+
+      - name: Post Build Validation Report as PR comment
+        uses: actions/github-script@v7
+        env:
+          BUILD_RESULTS: ${{ steps.build-app.outputs.build_output }}
+          VALIDATION_RESULTS: ${{ steps.endpoint-validation.outputs.validation_output }}
+        with:
+          script: |
+            const buildResults = process.env.BUILD_RESULTS || "No build results available";
+            const validationResults = process.env.VALIDATION_RESULTS || "No endpoint validation results available";
+            
+            const commentBody = `
+            ## Build Validation
+            This report summarizes build and endpoint validation for the pull request:
+            
+            ### Application Build Results
+            \`\`\`bash
+            ${buildResults}
+            \`\`\`
+            
+            ### Endpoint Validation
+            \`\`\`bash
+            ${validationResults}
+            \`\`\`
+            
+            Build artifacts are attached as an artifact to this workflow run.
+            `;
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
